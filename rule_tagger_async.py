@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import pandas as pd
 import json
+from datetime import datetime
 from dotenv import load_dotenv, find_dotenv
 from rich.console import Console
 from sumo_rule_payload_builder import (
@@ -16,19 +17,24 @@ console = Console()
 load_dotenv(find_dotenv())
 
 
-async def update_single_rule(session, rule_data, auth, endpoint):
+async def update_single_rule(session, rule_data, auth, endpoint, delay=0.5, max_retries=3):
     """
-    Update a single rule asynchronously
+    Update a single rule asynchronously with delay and retry logic
     
     Args:
         session: aiohttp ClientSession
-        rule_data: Dict with all rule info including payload, url, name, etc.
+        rule_data: Dict with all rule info
         auth: Tuple of (access_id, access_key)
         endpoint: Base API endpoint
+        delay: Seconds to wait before making request
+        max_retries: Number of times to retry on 500 errors
     
     Returns:
         Dict with result info
     """
+    # Add delay BEFORE making request (throttling)
+    await asyncio.sleep(delay)
+    
     rule_name = rule_data['name']
     rule_id = rule_data['id']
     operation = rule_data['operation']
@@ -40,44 +46,117 @@ async def update_single_rule(session, rule_data, auth, endpoint):
     console.log(f"  Tags: {tag_info}")
     console.log(f"  isPrototype: {payload['fields']['isPrototype']}")
     
-    try:
-        # Create BasicAuth
-        auth_obj = aiohttp.BasicAuth(auth[0], auth[1])
-        
-        async with session.put(
-            update_url,
-            auth=auth_obj,
-            json=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"}
-        ) as response:
+    # Retry loop
+    for attempt in range(max_retries):
+        try:
+            # Create BasicAuth
+            auth_obj = aiohttp.BasicAuth(auth[0], auth[1])
             
-            if response.status == 200:
-                console.log(f"  ✓ {operation} successful", style="bold green")
-                return {
-                    'success': True,
-                    'name': rule_name,
-                    'operation': operation
-                }
+            async with session.put(
+                update_url,
+                auth=auth_obj,
+                json=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json"}
+            ) as response:
+                
+                if response.status == 200:
+                    console.log(f"  ✓ {operation} successful", style="bold green")
+                    return {
+                        'success': True,
+                        'name': rule_name,
+                        'operation': operation
+                    }
+                elif response.status == 500:
+                    # Server error - retry
+                    error_text = await response.text()
+                    
+                    # Save failed payload for debugging
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    debug_file = f"failed_payload_{rule_id}_{timestamp}.json"
+                    with open(debug_file, 'w') as f:
+                        json.dump({
+                            'rule_name': rule_name,
+                            'rule_id': rule_id,
+                            'operation': operation,
+                            'url': update_url,
+                            'payload': payload,
+                            'response': error_text
+                        }, f, indent=2)
+                    console.log(f"  💾 Saved failed payload to: {debug_file}", style="dim")
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                        console.log(f"  ⚠ HTTP 500 - Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})...", style="yellow")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        console.log(f"  ✗ HTTP Error: 500 (after {max_retries} retries)", style="bold red")
+                        console.log(f"  Response: {error_text[:300]}")
+                        return {
+                            'success': False,
+                            'name': rule_name,
+                            'error': f"HTTP 500 after {max_retries} retries",
+                            'debug_file': debug_file
+                        }
+                elif response.status == 400:
+                    # Bad request - save payload and don't retry
+                    error_text = await response.text()
+                    
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    debug_file = f"bad_request_{rule_id}_{timestamp}.json"
+                    with open(debug_file, 'w') as f:
+                        json.dump({
+                            'rule_name': rule_name,
+                            'rule_id': rule_id,
+                            'operation': operation,
+                            'url': update_url,
+                            'payload': payload,
+                            'response': error_text
+                        }, f, indent=2)
+                    
+                    console.log(f"  ✗ HTTP Error: 400", style="bold red")
+                    console.log(f"  Response: {error_text[:300]}")
+                    console.log(f"  💾 Saved payload to: {debug_file}", style="dim")
+                    return {
+                        'success': False,
+                        'name': rule_name,
+                        'error': f"HTTP 400",
+                        'debug_file': debug_file
+                    }
+                else:
+                    # Other error - don't retry
+                    error_text = await response.text()
+                    console.log(f"  ✗ HTTP Error: {response.status}", style="bold red")
+                    console.log(f"  Response: {error_text[:300]}")
+                    return {
+                        'success': False,
+                        'name': rule_name,
+                        'error': f"HTTP {response.status}"
+                    }
+                    
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                console.log(f"  ⚠ Error: {str(e)} - Retrying in {wait_time}s...", style="yellow")
+                await asyncio.sleep(wait_time)
+                continue
             else:
-                error_text = await response.text()
-                console.log(f"  ✗ HTTP Error: {response.status}", style="bold red")
-                console.log(f"  Response: {error_text[:300]}")
+                console.log(f"  ✗ Error: {str(e)} (after {max_retries} retries)", style="bold red")
                 return {
                     'success': False,
                     'name': rule_name,
-                    'error': f"HTTP {response.status}"
+                    'error': str(e)
                 }
-                
-    except Exception as e:
-        console.log(f"  ✗ Error: {str(e)}", style="bold red")
-        return {
-            'success': False,
-            'name': rule_name,
-            'error': str(e)
-        }
+    
+    # Should not reach here, but just in case
+    return {
+        'success': False,
+        'name': rule_name,
+        'error': 'Max retries exceeded'
+    }
 
 
-async def process_rules_batch(rules_to_process, auth, endpoint, batch_size=10):
+async def process_rules_batch(rules_to_process, auth, endpoint, batch_size=5):
     """
     Process multiple rules concurrently in batches
     
@@ -85,7 +164,7 @@ async def process_rules_batch(rules_to_process, auth, endpoint, batch_size=10):
         rules_to_process: List of rule data dicts
         auth: Authentication tuple
         endpoint: Base endpoint
-        batch_size: Number of concurrent requests (default 10)
+        batch_size: Number of concurrent requests (default 5, safer for APIs)
     
     Returns:
         List of results
@@ -95,7 +174,7 @@ async def process_rules_batch(rules_to_process, auth, endpoint, batch_size=10):
     
     # Create aiohttp session with connection limits
     connector = aiohttp.TCPConnector(limit=batch_size)
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=120)  # Increased timeout
     
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         
@@ -105,8 +184,11 @@ async def process_rules_batch(rules_to_process, auth, endpoint, batch_size=10):
             
             console.print(f"\n[bold cyan]Processing batch {i//batch_size + 1} ({len(batch)} rules)...[/bold cyan]\n")
             
-            # Create tasks for this batch
-            tasks = [update_single_rule(session, rule, auth, endpoint) for rule in batch]
+            # Stagger requests in the batch (0s, 0.5s, 1s, 1.5s, etc.)
+            tasks = []
+            for idx, rule in enumerate(batch):
+                delay = idx * 0.5  # Stagger by 0.5 seconds each
+                tasks.append(update_single_rule(session, rule, auth, endpoint, delay=delay))
             
             # Run batch concurrently
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -119,9 +201,10 @@ async def process_rules_batch(rules_to_process, auth, endpoint, batch_size=10):
                 else:
                     all_results.append(result)
             
-            # Small delay between batches to be nice to the API
+            # Delay between batches
             if i + batch_size < len(rules_to_process):
-                await asyncio.sleep(0.5)
+                console.print(f"[dim]Waiting 2 seconds before next batch...[/dim]")
+                await asyncio.sleep(2)
     
     return all_results
 
@@ -185,14 +268,15 @@ def manage_rule_tags_async():
     
     # Get batch size
     console.print("\n[bold cyan]Step 3: Concurrency settings[/bold cyan]")
-    batch_size_input = input("Concurrent requests (default 10, max 20): ").strip()
+    batch_size_input = input("Concurrent requests (default 3, max 10): ").strip()
     try:
-        batch_size = int(batch_size_input) if batch_size_input else 10
-        batch_size = min(batch_size, 20)  # Cap at 20
+        batch_size = int(batch_size_input) if batch_size_input else 3
+        batch_size = min(batch_size, 10)  # Cap at 10
     except:
-        batch_size = 10
+        batch_size = 3
     
     console.log(f"Using batch size: {batch_size}")
+    console.log(f"[dim]Failed payloads will be saved to failed_payload_*.json files[/dim]")
     
     # Prepare all rules for processing
     rules_to_process = []
@@ -302,10 +386,19 @@ def manage_rule_tags_async():
     
     if failed:
         console.print(f"\n[bold red]✗ Failed: {len(failed)} rules[/bold red]")
+        debug_files = []
         for fail in failed[:10]:
-            console.log(f"  - {fail.get('name', 'unknown')}: {fail.get('error', 'unknown error')}", style="red")
+            error_msg = f"  - {fail.get('name', 'unknown')}: {fail.get('error', 'unknown error')}"
+            console.log(error_msg, style="red")
+            if 'debug_file' in fail:
+                debug_files.append(fail['debug_file'])
         if len(failed) > 10:
             console.print(f"  ... and {len(failed) - 10} more")
+        
+        if debug_files:
+            console.print(f"\n[dim]Debug files created: {len(debug_files)}[/dim]")
+            for df in debug_files[:5]:
+                console.print(f"  {df}", style="dim")
     
     if not_found:
         console.print(f"\n[yellow]⚠ Not found: {len(not_found)} rules[/yellow]")
@@ -319,5 +412,5 @@ def manage_rule_tags_async():
 
 if __name__ == "__main__":
     console.print("[bold cyan]Rule Tag & Prototype Manager (ASYNC)[/bold cyan]")
-    console.print("Fast bulk updates using concurrent requests\n")
+    console.print("Fast bulk updates with retry logic and debug logging\n")
     results = manage_rule_tags_async()
