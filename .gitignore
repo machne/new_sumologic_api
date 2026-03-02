@@ -107,3 +107,6 @@ venv.bak/
 #csv
 *.csv
 .vscode/
+
+#json
+*.json
