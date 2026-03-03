@@ -17,7 +17,7 @@ console = Console()
 load_dotenv(find_dotenv())
 
 
-async def update_single_rule(session, rule_data, auth, endpoint, delay=0.5, max_retries=3):
+async def update_single_rule(session, rule_data, auth, endpoint, delay=0.25, max_retries=3):
     """
     Update a single rule asynchronously with delay and retry logic
     
@@ -48,10 +48,10 @@ async def update_single_rule(session, rule_data, auth, endpoint, delay=0.5, max_
     
     # Retry loop
     for attempt in range(max_retries):
+        
         try:
             # Create BasicAuth
             auth_obj = aiohttp.BasicAuth(auth[0], auth[1])
-            
             async with session.put(
                 update_url,
                 auth=auth_obj,
@@ -70,6 +70,7 @@ async def update_single_rule(session, rule_data, auth, endpoint, delay=0.5, max_
                     # Server error - retry
                     error_text = await response.text()
                     
+                    """
                     # Save failed payload for debugging
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     debug_file = f"failed_payload_{rule_id}_{timestamp}.json"
@@ -83,6 +84,7 @@ async def update_single_rule(session, rule_data, auth, endpoint, delay=0.5, max_
                             'response': error_text
                         }, f, indent=2)
                     console.log(f"  💾 Saved failed payload to: {debug_file}", style="dim")
+                    """
                     
                     if attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
@@ -177,7 +179,6 @@ async def process_rules_batch(rules_to_process, auth, endpoint, batch_size=5):
     timeout = aiohttp.ClientTimeout(total=120)  # Increased timeout
     
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        
         # Process in batches to avoid overwhelming the API
         for i in range(0, len(rules_to_process), batch_size):
             batch = rules_to_process[i:i + batch_size]
@@ -205,7 +206,6 @@ async def process_rules_batch(rules_to_process, auth, endpoint, batch_size=5):
             if i + batch_size < len(rules_to_process):
                 console.print(f"[dim]Waiting 2 seconds before next batch...[/dim]")
                 await asyncio.sleep(2)
-    
     return all_results
 
 
@@ -283,6 +283,7 @@ def manage_rule_tags_async():
     not_found = []
     overrides_count = 0
     updates_count = 0
+    rules_count = 0
     
     console.print(f"\n[bold cyan]Preparing rules...[/bold cyan]")
     
@@ -359,7 +360,7 @@ def manage_rule_tags_async():
             'url': update_url,
             'tag_info': f"{len(combined_tags)} total ({len(mitre_tags)} MITRE + {len(new_non_mitre_tags)} custom)"
         })
-    
+    console.log(f"Pocessed rules count {rules_count}")
     console.log(f"✓ Prepared {len(rules_to_process)} rules for processing")
     console.log(f"  • Overrides: {overrides_count}")
     console.log(f"  • Updates: {updates_count}")
